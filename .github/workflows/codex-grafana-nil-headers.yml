@@ -1,0 +1,152 @@
+name: Fork validation - plugin nil headers
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'pkg/services/pluginsintegration/clientmiddleware/**'
+      - '.github/workflows/codex-grafana-nil-headers.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  middleware:
+    if: github.repository != 'grafana/grafana'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      BASE: c5731809008c246a61c8d4f84bf6a9fdfe0178c9
+      PACKAGE: ./pkg/services/pluginsintegration/clientmiddleware
+      CGO_ENABLED: '1'
+      GOMAXPROCS: '2'
+      GOFLAGS: '-p=2'
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: '1.26.6'
+          cache: false
+      - name: Verify source and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = go1.26.6
+          test "$(awk '$1 == "go" {print $2; exit}' go.mod)" = 1.26.6
+          test "$(awk '$1 == "go" {print $2; exit}' go.work)" = 1.26.6
+          go version
+          gcc --version
+          git fetch --no-tags --depth=1 https://github.com/grafana/grafana.git "$BASE"
+          cat <<'EOF' | sha256sum --check
+          f90956dbc18fcdcdac35634b67cf26b477ab29e3855ac2239e24c7c067f5752b  pkg/services/pluginsintegration/clientmiddleware/cookies_middleware.go
+          62059dd3e23858eb04705128c4b70f427711df8a0c44d7c76c9075bbdbf2dbc5  pkg/services/pluginsintegration/clientmiddleware/cookies_middleware_test.go
+          e666d08769ff8accb7c976745d3ece0539a6c6f04269300566a0b2b7bb78ad1d  pkg/services/pluginsintegration/clientmiddleware/oauthtoken_middleware.go
+          aa72dabee0b25640c6d10bdfbce960e59ad2902ede483d382a73fac9d5bcddec  pkg/services/pluginsintegration/clientmiddleware/oauthtoken_middleware_test.go
+          a6f20c52e8aaa87d68209844489931a2b074d594dceebdf24e06b0206214d059  pkg/services/pluginsintegration/clientmiddleware/usealertingheaders_middleware.go
+          345e71b6310a2ee378ae4f7a9dc0c38da4f305b917f38d47caab13c28ca24bcc  pkg/services/pluginsintegration/clientmiddleware/usealertingheaders_middleware_test.go
+          EOF
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          prefix = 'pkg/services/pluginsintegration/clientmiddleware/'
+          expected = {
+              prefix + name
+              for stem in ('cookies', 'oauthtoken', 'usealertingheaders')
+              for name in (stem + '_middleware.go', stem + '_middleware_test.go')
+          }
+          allowed = expected | {'.github/workflows/codex-grafana-nil-headers.yml'}
+          changed = set(subprocess.check_output(
+              ['git', 'diff', '--name-only', os.environ['BASE'], 'HEAD'], text=True,
+          ).splitlines())
+          if not expected <= changed or changed - allowed:
+              raise SystemExit(f'Unexpected changed files: {sorted(changed)}')
+          unformatted = subprocess.check_output(['gofmt', '-l', *sorted(expected)], text=True)
+          if unformatted:
+              raise SystemExit(f'Unformatted source: {unformatted}')
+          PY
+      - name: Reproduce all 10 regressions on baseline production code
+        shell: bash
+        run: |
+          set -euo pipefail
+          production=(
+            pkg/services/pluginsintegration/clientmiddleware/cookies_middleware.go
+            pkg/services/pluginsintegration/clientmiddleware/oauthtoken_middleware.go
+            pkg/services/pluginsintegration/clientmiddleware/usealertingheaders_middleware.go
+          )
+          trap 'git restore --source=HEAD --worktree -- "${production[@]}"' EXIT
+          git restore --source="$BASE" --worktree -- "${production[@]}"
+          set +e
+          go test -race -short -timeout=30m "$PACKAGE" \
+            -run 'Test(OAuthToken|Cookies|UserAlertingHeaders)Middleware' \
+            -count=1 -json > "$RUNNER_TEMP/baseline.json" 2>&1
+          status=$?
+          set -e
+          if [ "$status" -ne 1 ]; then
+            cat "$RUNNER_TEMP/baseline.json"
+            echo "Expected baseline test exit 1, got $status"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ['RUNNER_TEMP']) / 'baseline.json'
+          text = path.read_text()
+          events = []
+          for line in text.splitlines():
+              try:
+                  events.append(json.loads(line))
+              except json.JSONDecodeError:
+                  pass  # go may print dependency downloads before JSON events
+          expected = set()
+          for route in ('QueryData', 'QueryChunkedData', 'CallResource', 'CheckHealth'):
+              expected.add('TestCookiesMiddleware/When_keepCookies_configured_for_a_datasource/'
+                           f'Should_forward_cookies_with_nil_{route}_headers')
+              expected.add('TestOAuthTokenMiddleware/When_oauthPassThru_configured_for_a_datasource/'
+                           f'Should_forward_OAuth_Identity_with_nil_{route}_headers')
+          for route in ('QueryData', 'QueryChunkedData'):
+              expected.add('TestUserAlertingHeadersMiddleware/'
+                           f'Preserve_FromAlert_with_nil_headers_and_no_other_alerting_headers/{route}')
+          allowed = {name.rsplit('/', 1)[0] for name in expected}
+          allowed |= {name.split('/')[0] for name in expected}
+          failed = {event['Test'] for event in events
+                    if event.get('Action') == 'fail' and 'Test' in event}
+          output = ''.join(event.get('Output', '') for event in events)
+          if failed != expected | allowed or output.count('Panic value:\tassignment to entry in nil map') != 10:
+              print(text)
+              raise SystemExit(f'Unexpected baseline failures: {sorted(failed)}')
+          if 'WARNING: DATA RACE' in output:
+              print(text)
+              raise SystemExit('Unexpected data race during baseline reproduction')
+          print('Confirmed exactly 10 expected nil-map panic regressions:')
+          print('\n'.join(sorted(expected)))
+          PY
+      - name: Run complete middleware package with race detector
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          go test -race -short -timeout=30m "$PACKAGE" -count=1 -v \
+            2>&1 | tee "$RUNNER_TEMP/final-race.log"
+      - name: Lint with upstream configuration and pinned version
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a
+        with:
+          version: v2.12.2
+          args: --verbose ./pkg/services/pluginsintegration/clientmiddleware/...
+          install-mode: binary
+          skip-cache: true
+      - name: Preserve validation logs
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: grafana-nil-headers-linux-validation
+          path: |
+            ${{ runner.temp }}/baseline.json
+            ${{ runner.temp }}/final-race.log
+          if-no-files-found: ignore
