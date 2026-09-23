@@ -42,7 +42,7 @@ jobs:
           gcc --version
           git fetch --no-tags --depth=1 https://github.com/grafana/grafana.git "$BASE"
           cat <<'EOF' | sha256sum --check
-          f90956dbc18fcdcdac35634b67cf26b477ab29e3855ac2239e24c7c067f5752b  pkg/services/pluginsintegration/clientmiddleware/cookies_middleware.go
+          951778ab27c0d36ef9e0019a6a5bb93f003aa8c9a29777213e63aa41f2a098f8  pkg/services/pluginsintegration/clientmiddleware/cookies_middleware.go
           62059dd3e23858eb04705128c4b70f427711df8a0c44d7c76c9075bbdbf2dbc5  pkg/services/pluginsintegration/clientmiddleware/cookies_middleware_test.go
           e666d08769ff8accb7c976745d3ece0539a6c6f04269300566a0b2b7bb78ad1d  pkg/services/pluginsintegration/clientmiddleware/oauthtoken_middleware.go
           aa72dabee0b25640c6d10bdfbce960e59ad2902ede483d382a73fac9d5bcddec  pkg/services/pluginsintegration/clientmiddleware/oauthtoken_middleware_test.go
